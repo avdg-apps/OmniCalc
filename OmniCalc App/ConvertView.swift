@@ -42,6 +42,7 @@ struct ConvertView: View {
     @State private var to = "Feet"
     @State private var swapTurns = 0.0
     @State private var copied = false
+    @Namespace private var chipNS
     @AppStorage("sigDigits") private var sigDigits = 0
 
     private var names: [String] {
@@ -139,10 +140,16 @@ struct ConvertView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 ForEach(UnitCategory.allCases) { c in
-                    Button { withAnimation(.smooth) { category = c } } label: {
+                    Button { withAnimation(.spring(response: 0.4, dampingFraction: 0.78)) { category = c } } label: {
                         Text(c.rawValue).font(.subheadline.weight(.medium))
                             .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(category == c ? theme.accent : Color.primary.opacity(0.08), in: Capsule())
+                            .background {
+                                if category == c {
+                                    Capsule().fill(theme.accent).matchedGeometryEffect(id: "chip", in: chipNS)
+                                } else {
+                                    Capsule().fill(Color.primary.opacity(0.08))
+                                }
+                            }
                             .foregroundStyle(category == c ? Color.white : Color.primary)
                     }.buttonStyle(PressableStyle())
                 }

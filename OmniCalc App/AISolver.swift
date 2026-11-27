@@ -8,13 +8,14 @@ struct AISolution: Codable {
 }
 
 enum AISolverError: LocalizedError {
-    case missingKey, rateLimited, http(Int, String), badResponse
+    case missingKey, rateLimited, http(Int, String), badResponse, modelUnavailable(String)
     var errorDescription: String? {
         switch self {
         case .missingKey: return "Add your Gemini API key in Secrets.swift first."
         case .rateLimited: return "Free-tier limit reached. Wait a minute and try again."
         case .http(let code, let body): return "AI request failed (\(code)). \(body.prefix(160))"
         case .badResponse: return "The AI returned something unreadable. Try rephrasing."
+        case .modelUnavailable(let name): return "The AI model \(name) isn't available any more. Set a current one in Settings > AI Solver."
         }
     }
 }
@@ -32,7 +33,6 @@ enum AISolver {
 
     static func solve(_ problem: String, image: Data? = nil) async throws -> AISolution {
         guard !AIConfig.isMissingKey else { throw AISolverError.missingKey }
-        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(AIConfig.activeModel):generateContent") else { throw AISolverError.badResponse }
 
         var parts: [[String: Any]] = [["text": problem.isEmpty ? "Solve the problem in the image." : problem]]
         if let image { parts.append(["inline_data": ["mime_type": "image/jpeg", "data": image.base64EncodedString()]]) }
@@ -41,12 +41,28 @@ enum AISolver {
             "contents": [["role": "user", "parts": parts]],
             "generationConfig": ["responseMimeType": "application/json", "temperature": 0.2]
         ]
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+
+        // If a model has been retired, quietly move on to the next one.
+        var lastError: Error = AISolverError.badResponse
+        for model in AIConfig.candidateModels {
+            do { return try await call(model: model, body: bodyData) }
+            catch let e as AISolverError {
+                if case .modelUnavailable = e { lastError = e; continue }
+                throw e
+            }
+        }
+        throw lastError
+    }
+
+    private static func call(model: String, body: Data) async throws -> AISolution {
+        guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent") else { throw AISolverError.badResponse }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 90
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(AIConfig.apiKey, forHTTPHeaderField: "x-goog-api-key")
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        req.httpBody = body
 
         // Free tier is busy/limited at times: retry politely.
         for attempt in 0..<3 {
@@ -56,7 +72,13 @@ enum AISolver {
                 if attempt < 2 { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 3_000_000_000); continue }
                 throw http.statusCode == 429 ? AISolverError.rateLimited : AISolverError.http(503, "Model busy")
             }
-            guard http.statusCode == 200 else { throw AISolverError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "") }
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let lower = text.lowercased()
+            let modelGone = http.statusCode == 404
+                || ([400, 403].contains(http.statusCode) && lower.contains("model")
+                    && ["not found", "no longer", "not available", "deprecated", "not supported"].contains { lower.contains($0) })
+            if modelGone { throw AISolverError.modelUnavailable(model) }
+            guard http.statusCode == 200 else { throw AISolverError.http(http.statusCode, text) }
             return try parse(data)
         }
         throw AISolverError.badResponse

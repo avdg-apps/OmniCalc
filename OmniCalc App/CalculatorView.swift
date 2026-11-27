@@ -38,13 +38,19 @@ final class CalculatorModel {
 
     func load(_ expr: String) { errorMessage = nil; expression = expr; justEvaluated = false }
 
+    /// Removes one character at a time (a whole function name or "Ans" counts as one).
+    /// After "=" it edits the shown result instead of wiping it.
     private func backspace() {
-        if justEvaluated { expression = ""; justEvaluated = false; return }
+        justEvaluated = false
         guard !expression.isEmpty else { return }
-        if expression.hasSuffix("(") {
+        if expression.hasSuffix("Ans") {
+            expression.removeLast(3)
+        } else if expression.hasSuffix("(") {
             expression.removeLast()
             while let l = expression.last, l.isLetter || l == "√" { expression.removeLast() }
-        } else { expression.removeLast() }
+        } else {
+            expression.removeLast()
+        }
     }
 
     private func engine() -> ExpressionEngine { var e = ExpressionEngine(); e.degrees = degrees; e.ans = ans; return e }
@@ -73,6 +79,11 @@ struct CalculatorView: View {
     @State private var showHistory = false
     @State private var mode = Mode.calculator
     @State private var tick = 0
+    @State private var lastKey = ""
+    @State private var appeared = false
+    @State private var shakes = 0
+    @State private var pulse = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var keysFocused: Bool
 
     enum Mode: String, CaseIterable, Identifiable {
@@ -91,7 +102,7 @@ struct CalculatorView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                theme.background.ignoresSafeArea()
+                ThemeBackdrop().ignoresSafeArea()
                 switch mode {
                 case .calculator: calculator.transition(.opacity)
                 case .fractions: FractionsView().transition(.opacity)
@@ -118,23 +129,35 @@ struct CalculatorView: View {
             .sheet(isPresented: $showHistory) { HistorySheet(model: model) }
         }
         .onChange(of: degrees, initial: true) { model.degrees = degrees }
-        .sensoryFeedback(trigger: tick) { _, _ in haptics ? SensoryFeedback.impact(weight: .light) : nil }
+        .sensoryFeedback(trigger: tick) { _, _ in
+            guard haptics else { return nil }
+            return lastKey == "=" ? SensoryFeedback.impact(weight: .medium) : SensoryFeedback.impact(weight: .light)
+        }
     }
 
     private var calculator: some View {
         VStack(spacing: 12) {
             display
-            if scientific { keyGrid(sciRows, height: 46).transition(.move(edge: .top).combined(with: .opacity)) }
+            if scientific {
+                keyGrid(sciRows, height: 46)
+                    .transition(.asymmetric(insertion: .scale(scale: 0.92, anchor: .top).combined(with: .opacity).combined(with: .move(edge: .top)),
+                                            removal: .scale(scale: 0.92, anchor: .top).combined(with: .opacity)))
+            }
             keyGrid(mainRows, height: 62)
         }
-        .animation(.smooth(duration: 0.3), value: scientific)
+        .animation(.spring(response: 0.45, dampingFraction: 0.82), value: scientific)
         .padding(.horizontal).padding(.bottom, 8)
         .frame(maxWidth: 460).frame(maxWidth: .infinity)
         .focusable()
         .focused($keysFocused)
         .focusEffectDisabled()
         .onKeyPress(phases: .down) { handle($0) }
-        .onAppear { keysFocused = true }
+        .onAppear { keysFocused = true; appeared = true }
+        .onChange(of: model.errorMessage) { _, new in if new != nil { shakes += 1 } }
+        .onChange(of: model.history.count) { _, _ in
+            pulse = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { pulse = false }
+        }
     }
 
     private var display: some View {
@@ -163,10 +186,15 @@ struct CalculatorView: View {
         .cardStyle()
         .animation(.snappy(duration: 0.2), value: model.expression)
         .animation(.snappy(duration: 0.2), value: model.preview)
+        .scaleEffect(pulse && !reduceMotion ? 1.035 : 1)
+        .animation(.spring(response: 0.3, dampingFraction: 0.45), value: pulse)
+        .modifier(ShakeEffect(shakes: CGFloat(shakes)))
+        .animation(.easeOut(duration: 0.45), value: shakes)
     }
 
     /// Defer model changes out of the current view update.
     private func send(_ key: String) {
+        lastKey = key
         tick += 1
         DispatchQueue.main.async { model.press(key) }
     }
@@ -188,10 +216,15 @@ struct CalculatorView: View {
 
     private func keyGrid(_ rows: [[String]], height: CGFloat) -> some View {
         VStack(spacing: 10) {
-            ForEach(rows, id: \.self) { row in
+            ForEach(Array(rows.enumerated()), id: \.offset) { r, row in
                 HStack(spacing: 10) {
-                    ForEach(row, id: \.self) { key in
-                        KeyButton(label: key, height: height) { send(key) }
+                    ForEach(Array(row.enumerated()), id: \.offset) { c, key in
+                        KeyButton(label: key, height: height, action: { send(key) },
+                                  onLongPress: key == "⌫" ? { send("AC") } : nil)
+                            .opacity(appeared ? 1 : 0)
+                            .scaleEffect(appeared ? 1 : 0.8)
+                            .animation(.spring(response: 0.45, dampingFraction: 0.72)
+                                .delay(reduceMotion ? 0 : Double(r * 4 + c) * 0.022), value: appeared)
                     }
                 }
             }
@@ -204,6 +237,7 @@ struct KeyButton: View {
     let label: String
     let height: CGFloat
     let action: () -> Void
+    var onLongPress: (() -> Void)? = nil
 
     private var isOp: Bool { ["÷", "×", "−", "+"].contains(label) }
     private var isUtil: Bool { ["AC", "⌫", "%"].contains(label) }
@@ -225,7 +259,8 @@ struct KeyButton: View {
                 .shadow(color: .black.opacity(isDigit ? 0.06 : 0), radius: 3, y: 1)
                 .foregroundStyle(label == "=" ? Color.white : (isOp ? theme.accent : Color.primary))
         }
-        .buttonStyle(PressableStyle())
+        .buttonStyle(KeyPressStyle())
+        .simultaneousGesture(LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() })
     }
 }
 
@@ -235,14 +270,19 @@ struct HistorySheet: View {
 
     var body: some View {
         NavigationStack {
-            List(model.history) { item in
-                Button { model.load(item.expr); dismiss() } label: {
-                    VStack(alignment: .trailing) {
-                        Text(item.expr).foregroundStyle(.secondary)
-                        Text(item.result).font(.title3.weight(.medium))
-                    }.frame(maxWidth: .infinity, alignment: .trailing)
+            List {
+                ForEach(model.history) { item in
+                    Button { model.load(item.expr); dismiss() } label: {
+                        VStack(alignment: .trailing) {
+                            Text(item.expr).foregroundStyle(.secondary)
+                            Text(item.result).font(.title3.weight(.medium))
+                        }.frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                    .transition(.asymmetric(insertion: .move(edge: .top).combined(with: .opacity), removal: .opacity))
                 }
+                .onDelete { model.history.remove(atOffsets: $0) }
             }
+            .animation(.smooth(duration: 0.3), value: model.history.count)
             .themedList()
             .overlay { if model.history.isEmpty { Text("No history yet").foregroundStyle(.secondary) } }
             .navigationTitle("History").inlineTitle()
